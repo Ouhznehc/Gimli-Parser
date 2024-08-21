@@ -1,0 +1,9 @@
+[package]
+name = "gimli-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gimli = "0.31.0"
+object = { version = "0.36.0", features = ["wasm", "write"] }
+memmap2 = "0.9.4"
