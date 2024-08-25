@@ -1,12 +1,3 @@
-//! A simple example of parsing `.debug_info`.
-//!
-//! This example demonstrates how to parse the `.debug_info` section of a
-//! DWARF object file and iterate over the compilation units and their DIEs.
-//! It also demonstrates how to find the DWO unit for each CU in a DWP file.
-//!
-//! Most of the complexity is due to loading the sections from the object
-//! file and DWP file, which is not something that is provided by gimli itself.
-
 use fallible_iterator::FallibleIterator;
 use gimli::Reader as _;
 use object::{Object, ObjectSection};
@@ -116,17 +107,92 @@ fn dump_unit(unit: gimli::UnitRef<Reader>) -> Result<(), gimli::Error> {
     let mut entries = unit.entries();
     while let Some((delta_depth, entry)) = entries.next_dfs()? {
         depth += delta_depth;
-        println!("<{}><{}> {}", depth, entry.offset().0, entry.tag());
 
-        // Iterate over the attributes in the DIE.
-        let mut attrs = entry.attrs();
-        while let Some(attr) = attrs.next()? {
-            print!("   {}: {:?}", attr.name(), attr.value());
-            
-            if let Ok(s) = unit.attr_string(attr.value()) {
-                print!(" '{}'", s.to_string_lossy()?);
+        println!("{}<{}> {}", depth, entry.offset().0, entry.tag());
+
+        match entry.tag() {
+            gimli::DW_TAG_subprogram => dw_tag_subprogram_handler(&unit, &entry)?,
+            _ => dw_tag_default_handler(&unit, &entry)?
+        }
+
+    }
+    Ok(())
+}
+
+
+fn dw_tag_subprogram_handler<'a>(
+    unit: &gimli::UnitRef<Reader<'a>>,
+    entry: &gimli::DebuggingInformationEntry<Reader<'a>>
+) -> Result<(), gimli::Error> {
+    let mut attrs = entry.attrs();
+    while let Some(attr) = attrs.next()? {
+        match attr.name() {
+            gimli::DW_AT_name | gimli::DW_AT_linkage_name => {
+                println!("   {}: {:?}", attr.name(), dw_at_name_handler(&unit, &attr)?);
             }
-            println!();
+            gimli::DW_AT_type => {
+                println!("   {}: {:?}", attr.name(), dw_at_type_handler(&attr)?);
+            }
+            _ => {
+                continue;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dw_tag_default_handler<'a>(
+    unit: &gimli::UnitRef<Reader<'a>>,
+    entry: &gimli::DebuggingInformationEntry<Reader<'a>>
+) -> Result<(), gimli::Error> {
+    let mut attrs = entry.attrs();
+    while let Some(attr) = attrs.next()? {
+        println!("   {}: {:?}", attr.name(), dw_at_name_handler(&unit, &attr)?);
+    }
+    Ok(())
+}
+
+fn dw_at_name_handler<'a>(
+    unit: &gimli::UnitRef<Reader<'a>>,
+    attr: &gimli::Attribute<Reader<'a>>,
+) -> Result<String, gimli::Error> {
+    match unit.attr_string(attr.value()) {
+        Ok(string) => Ok(string.to_string_lossy()?.to_string()),
+        Err(_) => Ok(format!("{:?}", attr.value())),
+    }
+}
+
+fn dw_at_type_handler<'a>(
+    attr: &gimli::Attribute<Reader<'a>>,
+) -> Result<usize, gimli::Error> {
+    if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
+        Ok(offset.0)
+    } else {
+        Err(gimli::Error::UnsupportedOffset)
+    }
+}
+
+fn _dw_at_exprloc_handler(
+    unit: &gimli::Unit<Reader>,
+    attr: &gimli::Attribute<Reader>,
+) -> Result<(), gimli::Error> {
+    let expression = attr.exprloc_value().unwrap();
+    let mut eval = expression.evaluation(unit.encoding());
+    let mut result = eval.evaluate().unwrap();
+    loop {
+        match result {
+            gimli::EvaluationResult::Complete => {
+                let value = eval.result();
+                print!("   {}: {:?}", attr.name(), value);
+                break;
+            }
+            gimli::EvaluationResult::RequiresFrameBase => {
+                result = eval.resume_with_frame_base(0).unwrap();
+            }
+            _ =>  {
+                print!("   {}: {:?}", attr.name(), result);
+                break;
+            }
         }
     }
     Ok(())
