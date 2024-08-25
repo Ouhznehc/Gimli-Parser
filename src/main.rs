@@ -52,6 +52,7 @@ fn main() {
     dump_file(&object, endian).unwrap();
 }
 
+/// Get the DWARF information from the object file.
 fn dump_file(
     object: &object::File,
     endian: gimli::RunTimeEndian,
@@ -101,6 +102,7 @@ fn dump_file(
     Ok(())
 }
 
+/// Iterate over the Debugging Information Entries (DIEs) in the unit.
 fn dump_unit(unit: gimli::UnitRef<Reader>) -> Result<(), gimli::Error> {
     // Iterate over the Debugging Information Entries (DIEs) in the unit.
     let mut depth = 0;
@@ -112,28 +114,35 @@ fn dump_unit(unit: gimli::UnitRef<Reader>) -> Result<(), gimli::Error> {
 
         match entry.tag() {
             gimli::DW_TAG_subprogram => dw_tag_subprogram_handler(&unit, &entry)?,
-            _ => dw_tag_default_handler(&unit, &entry)?
+            gimli::DW_TAG_variable => dw_tag_variable_handler(&unit, &entry)?,
+            _ => dw_tag_default_handler(&unit, &entry)?,
         }
-
     }
     Ok(())
 }
 
 
+/// Handler for DW_TAG_subprogram, which is a function or method.
+/// we are interested in the name, linkage name, and return type of the function.
 fn dw_tag_subprogram_handler<'a>(
     unit: &gimli::UnitRef<Reader<'a>>,
-    entry: &gimli::DebuggingInformationEntry<Reader<'a>>
+    entry: &gimli::DebuggingInformationEntry<Reader<'a>>,
 ) -> Result<(), gimli::Error> {
     let mut attrs = entry.attrs();
     while let Some(attr) = attrs.next()? {
         match attr.name() {
             gimli::DW_AT_name | gimli::DW_AT_linkage_name => {
-                println!("   {}: {:?}", attr.name(), dw_at_name_handler(&unit, &attr)?);
+                println!(
+                    "   {}: {:?}",
+                    attr.name(),
+                    dw_at_name_handler(&unit, &attr)?
+                );
             }
             gimli::DW_AT_type => {
                 println!("   {}: {:?}", attr.name(), dw_at_type_handler(&attr)?);
             }
             _ => {
+                // println!("   {}: Unparsed Attribute", attr.name());
                 continue;
             }
         }
@@ -141,17 +150,58 @@ fn dw_tag_subprogram_handler<'a>(
     Ok(())
 }
 
-fn dw_tag_default_handler<'a>(
+
+/// Handler for DW_TAG_variable, which is a local variable.
+/// we are interested in the name, type, and location(stack offset) of the variable.
+fn dw_tag_variable_handler<'a>(
     unit: &gimli::UnitRef<Reader<'a>>,
-    entry: &gimli::DebuggingInformationEntry<Reader<'a>>
+    entry: &gimli::DebuggingInformationEntry<Reader<'a>>,
 ) -> Result<(), gimli::Error> {
     let mut attrs = entry.attrs();
     while let Some(attr) = attrs.next()? {
-        println!("   {}: {:?}", attr.name(), dw_at_name_handler(&unit, &attr)?);
+        match attr.name() {
+            gimli::DW_AT_name => {
+                println!(
+                    "   {}: {:?}",
+                    attr.name(),
+                    dw_at_name_handler(&unit, &attr)?
+                );
+            }
+            gimli::DW_AT_type => {
+                println!("   {}: {:?}", attr.name(), dw_at_type_handler(&attr)?);
+            }
+            gimli::DW_AT_location => {
+                println!("   {}: {:?}", attr.name(), dw_at_location_handler(&unit, &attr)?);
+            }
+            _ => {
+                // println!("   {}: Unparsed Attribute", attr.name());
+                continue;
+            }
+        }
     }
     Ok(())
 }
 
+
+/// Handler for other DW_TAG_*, which is currently not parsed.
+/// we just print all the attributes.
+fn dw_tag_default_handler<'a>(
+    unit: &gimli::UnitRef<Reader<'a>>,
+    entry: &gimli::DebuggingInformationEntry<Reader<'a>>,
+) -> Result<(), gimli::Error> {
+    let mut attrs = entry.attrs();
+    while let Some(attr) = attrs.next()? {
+        println!(
+            "   {}: {:?}",
+            attr.name(),
+            dw_at_name_handler(&unit, &attr)?
+        );
+    }
+    Ok(())
+}
+
+/// Handler for DW_AT_name, which is a string attribute.
+/// we convert the attribute value from a DebugStrRef(offset) to a string.
 fn dw_at_name_handler<'a>(
     unit: &gimli::UnitRef<Reader<'a>>,
     attr: &gimli::Attribute<Reader<'a>>,
@@ -162,9 +212,9 @@ fn dw_at_name_handler<'a>(
     }
 }
 
-fn dw_at_type_handler<'a>(
-    attr: &gimli::Attribute<Reader<'a>>,
-) -> Result<usize, gimli::Error> {
+/// Handler for DW_AT_type, which is a reference to another DW_TAG_type.
+/// we convert the attribute value from a UnitRef(offset) to a usize, which stands for a DW_TAG_type node.
+fn dw_at_type_handler<'a>(attr: &gimli::Attribute<Reader<'a>>) -> Result<usize, gimli::Error> {
     if let gimli::AttributeValue::UnitRef(offset) = attr.value() {
         Ok(offset.0)
     } else {
@@ -172,7 +222,9 @@ fn dw_at_type_handler<'a>(
     }
 }
 
-fn _dw_at_exprloc_handler(
+/// Handler for DW_AT_location, which is a location expression.
+/// we evaluate the expression and print the result.
+fn dw_at_location_handler(
     unit: &gimli::Unit<Reader>,
     attr: &gimli::Attribute<Reader>,
 ) -> Result<(), gimli::Error> {
@@ -189,7 +241,7 @@ fn _dw_at_exprloc_handler(
             gimli::EvaluationResult::RequiresFrameBase => {
                 result = eval.resume_with_frame_base(0).unwrap();
             }
-            _ =>  {
+            _ => {
                 print!("   {}: {:?}", attr.name(), result);
                 break;
             }
