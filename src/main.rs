@@ -1,7 +1,17 @@
 use fallible_iterator::FallibleIterator;
 use gimli::Reader as _;
+use lazy_static::lazy_static;
 use object::{Object, ObjectSection};
+use serde_json::to_writer_pretty;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::{borrow, env, error, fs};
+
+lazy_static! {
+    // The map that stores the subprogram data.
+    static ref SUBPROGRAM_MAP: RwLock<HashMap<String, Subprogram>> = RwLock::new(HashMap::new());
+    static ref CURRENT_SUBPROGRAM: RwLock<Option<String>> = RwLock::new(None);
+}
 
 // This is a simple wrapper around `object::read::RelocationMap` that implements
 // `gimli::read::Relocate` for use with `gimli::RelocateReader`.
@@ -26,6 +36,26 @@ struct Section<'data> {
     relocations: RelocationMap,
 }
 
+// The struct that represents a local variable in the stack.
+// var_type is a usize that stands for a DW_TAG_type node.
+// location is a stack offset and is None if the location expression is not `RequiredFrameBase`.
+#[derive(Debug, serde::Serialize)]
+struct Variable {
+    name: String,
+    var_type: usize,
+    location: Option<i64>,
+}
+
+// The struct that represents a function or method.
+// The linkage_name is used as the key in the subprogram map, and it stands for the function name in elf file.
+#[derive(Debug, serde::Serialize)]
+struct Subprogram {
+    name: String,
+    linkage_name: String,
+    ret_type: usize,
+    variables: Vec<Variable>,
+}
+
 // The reader type that will be stored in `Dwarf` and `DwarfPackage`.
 // If you don't need relocations, you can use `gimli::EndianSlice` directly.
 type Reader<'data> =
@@ -33,12 +63,20 @@ type Reader<'data> =
 
 fn main() {
     let mut args = env::args();
-    if args.len() != 2 {
-        println!("Usage: {} <file>", args.next().unwrap());
+    if args.len() != 4 {
+        println!(
+            "Usage: {} <file> <subprogram.out> <type.out>",
+            args.next().unwrap()
+        );
         return;
     }
     args.next().unwrap();
     let path = args.next().unwrap();
+    // The output file for the subprogram data, which is a JSON file.
+    // The JSON file contains the name, linkage name, return type, and local variables of each function.
+    let subprogram_out = args.next().unwrap();
+    // The output file for the type data, which is a JSON file.
+    let _type_out = args.next().unwrap();
 
     let file = fs::File::open(path).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
@@ -50,6 +88,11 @@ fn main() {
     };
 
     dump_file(&object, endian).unwrap();
+
+    let map = SUBPROGRAM_MAP.read().unwrap();
+    let file = fs::File::create(subprogram_out).expect("Unable to create file");
+    to_writer_pretty(file, &*map).expect("Unable to write data");
+    println!("Data successfully written to the output file.");
 }
 
 /// Get the DWARF information from the object file.
@@ -110,7 +153,7 @@ fn dump_unit(unit: gimli::UnitRef<Reader>) -> Result<(), gimli::Error> {
     while let Some((delta_depth, entry)) = entries.next_dfs()? {
         depth += delta_depth;
 
-        println!("{}<{}> {}", depth, entry.offset().0, entry.tag());
+        println!("<{}><{}> {}", depth, entry.offset().0, entry.tag());
 
         match entry.tag() {
             gimli::DW_TAG_subprogram => dw_tag_subprogram_handler(&unit, &entry)?,
@@ -121,25 +164,30 @@ fn dump_unit(unit: gimli::UnitRef<Reader>) -> Result<(), gimli::Error> {
     Ok(())
 }
 
-
 /// Handler for DW_TAG_subprogram, which is a function or method.
 /// we are interested in the name, linkage name, and return type of the function.
 fn dw_tag_subprogram_handler<'a>(
     unit: &gimli::UnitRef<Reader<'a>>,
     entry: &gimli::DebuggingInformationEntry<Reader<'a>>,
 ) -> Result<(), gimli::Error> {
+    let mut name = String::new();
+    let mut linkage_name = String::new();
+    let mut ret_type = 0;
+
     let mut attrs = entry.attrs();
     while let Some(attr) = attrs.next()? {
         match attr.name() {
-            gimli::DW_AT_name | gimli::DW_AT_linkage_name => {
-                println!(
-                    "   {}: {:?}",
-                    attr.name(),
-                    dw_at_name_handler(&unit, &attr)?
-                );
+            gimli::DW_AT_name => {
+                name = dw_at_name_handler(&unit, &attr)?;
+                println!("   {}: {:?}", attr.name(), name);
+            }
+            gimli::DW_AT_linkage_name => {
+                linkage_name = dw_at_name_handler(&unit, &attr)?;
+                println!("   {}: {:?}", attr.name(), linkage_name);
             }
             gimli::DW_AT_type => {
                 println!("   {}: {:?}", attr.name(), dw_at_type_handler(&attr)?);
+                ret_type = dw_at_type_handler(&attr)?;
             }
             _ => {
                 // println!("   {}: Unparsed Attribute", attr.name());
@@ -147,9 +195,25 @@ fn dw_tag_subprogram_handler<'a>(
             }
         }
     }
+
+    // Insert the subprogram data into the map.
+    let mut map = SUBPROGRAM_MAP.write().unwrap();
+    map.insert(
+        linkage_name.clone(),
+        Subprogram {
+            name,
+            linkage_name: linkage_name.clone(),
+            ret_type,
+            variables: Vec::new(),
+        },
+    );
+
+    // Update the current subprogram.
+    let mut current_subprogram = CURRENT_SUBPROGRAM.write().unwrap();
+    *current_subprogram = Some(linkage_name.clone());
+
     Ok(())
 }
-
 
 /// Handler for DW_TAG_variable, which is a local variable.
 /// we are interested in the name, type, and location(stack offset) of the variable.
@@ -157,21 +221,23 @@ fn dw_tag_variable_handler<'a>(
     unit: &gimli::UnitRef<Reader<'a>>,
     entry: &gimli::DebuggingInformationEntry<Reader<'a>>,
 ) -> Result<(), gimli::Error> {
+    let mut name = String::new();
+    let mut var_type = 0;
+    let mut location = None;
+
     let mut attrs = entry.attrs();
     while let Some(attr) = attrs.next()? {
         match attr.name() {
             gimli::DW_AT_name => {
-                println!(
-                    "   {}: {:?}",
-                    attr.name(),
-                    dw_at_name_handler(&unit, &attr)?
-                );
+                name = dw_at_name_handler(&unit, &attr)?;
+                println!("   {}: {:?}", attr.name(), name);
             }
             gimli::DW_AT_type => {
-                println!("   {}: {:?}", attr.name(), dw_at_type_handler(&attr)?);
+                var_type = dw_at_type_handler(&attr)?;
+                println!("   {}: {:?}", attr.name(), var_type);
             }
             gimli::DW_AT_location => {
-                println!("   {}: {:?}", attr.name(), dw_at_location_handler(&unit, &attr)?);
+                location = dw_at_location_handler(&unit, &attr)?;
             }
             _ => {
                 // println!("   {}: Unparsed Attribute", attr.name());
@@ -179,9 +245,30 @@ fn dw_tag_variable_handler<'a>(
             }
         }
     }
+
+    // The current subprogram is the key in the subprogram map.
+    // If the current subprogram is None, which stand for a global variable, we just ignore it.
+    let linkage_name = {
+        let current_subprogram = CURRENT_SUBPROGRAM.read().unwrap();
+        match &*current_subprogram {
+            Some(name) => name.clone(),
+            None => {
+                return Ok(());
+            }
+        }
+    };
+
+    let mut map = SUBPROGRAM_MAP.write().unwrap();
+    if let Some(subprogram) = map.get_mut(&linkage_name) {
+        subprogram.variables.push(Variable {
+            name,
+            var_type,
+            location,
+        });
+    }
+
     Ok(())
 }
-
 
 /// Handler for other DW_TAG_*, which is currently not parsed.
 /// we just print all the attributes.
@@ -227,25 +314,40 @@ fn dw_at_type_handler<'a>(attr: &gimli::Attribute<Reader<'a>>) -> Result<usize, 
 fn dw_at_location_handler(
     unit: &gimli::Unit<Reader>,
     attr: &gimli::Attribute<Reader>,
-) -> Result<(), gimli::Error> {
+) -> Result<Option<i64>, gimli::Error> {
     let expression = attr.exprloc_value().unwrap();
     let mut eval = expression.evaluation(unit.encoding());
     let mut result = eval.evaluate().unwrap();
     loop {
         match result {
+            // When calculation is complete, print the result.
             gimli::EvaluationResult::Complete => {
-                let value = eval.result();
-                print!("   {}: {:?}", attr.name(), value);
-                break;
+                let value = eval
+                    .value_result()
+                    .unwrap()
+                    .convert(gimli::ValueType::I64, 0xFFFFFFFFFFFFFFFF)
+                    .unwrap();
+                match value {
+                    gimli::Value::I64(val) => {
+                        println!("   {}: {:?}", attr.name(), val);
+                        return Ok(Some(val));
+                    }
+                    _ => {
+                        println!("   {}: {:?}", attr.name(), value);
+                        return Ok(None);
+                    }
+                }
             }
+            // We currently only care about the RequiresFrameBase Expression.
+            // Set the frame base to 0 to calculate the offset.
             gimli::EvaluationResult::RequiresFrameBase => {
                 result = eval.resume_with_frame_base(0).unwrap();
             }
+            // Unparsed Expression, print the result and break.
             _ => {
-                print!("   {}: {:?}", attr.name(), result);
-                break;
+                println!("   {}: Unparsed Expression: {:?}", attr.name(), result);
+                return Ok(None);
             }
         }
     }
-    Ok(())
 }
